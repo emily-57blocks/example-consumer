@@ -1,0 +1,197 @@
+name: Trigger Contract Test
+run-name: Publish Pact - ${{github.actor}} - ${{ github.head_ref }}
+
+on:
+  pull_request:
+      types: [labeled]       
+     
+env:
+  PACT_BROKER_BASE_URL: https://sspbroker.ads-qa.vungle.com
+  PACT_BROKER_USERNAME: ssppackbroker
+  PACT_BROKER_PASSWORD: ssppackpwd
+  GIT_COMMIT: ${{ github.event.pull_request.head.sha }}
+  GIT_REF:  ${{ github.ref }}
+  VAULT_ADDR: "https://vault.ops.vungle.io"
+
+jobs:
+  parepare-env:
+     if: |
+        contains(github.event.pull_request.labels.*.name, 'Asks Contract Test')
+     runs-on: ubuntu-latest
+     steps:
+       - name: Get branch name
+         run: |
+          echo "BRANCH_NAME=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
+       - name: Cal Image Tag   
+         run: |
+          echo "CAL_IMAGE_TAG=$(echo "PR-${{ github.event.pull_request.number }}-${{ env.GIT_COMMIT }}")" >> $GITHUB_ENV
+       - name: Get short sha
+         run: |
+          echo "SHORT_SHA=$(git rev-parse --short "${GITHUB_SHA}")"  >> $GITHUB_ENV   
+     outputs:  
+       BRANCH_NAME: ${{ env.BRANCH_NAME }}
+       CAL_IMAGE_TAG: ${{ env.CAL_IMAGE_TAG }}
+       SHORT_SHA : ${{ env.SHORT_SHA }}
+        
+  publish-pact:
+    runs-on: ubuntu-latest
+    needs:  parepare-env
+    continue-on-error: true 
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v1
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Check out Repository Code
+        uses: actions/checkout@v3  # https://github.com/actions/checkout
+        with:
+          ref: ${{env.GIT_REF}}
+          
+      - name: install pact broker cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/pact-foundation/pact-ruby-standalone/master/install.sh | PACT_CLI_VERSION=v2.0.10 bash
+          export PATH=/home/runner/work/jaeger/jaeger/pact/bin/:${PATH}
+      - name: prepare pytest running environment
+        run: |
+           docker pull sqli0189/jnlp-agent-pytest:0.2.0-rc
+           pip install pytest
+           pip install pact-python
+      - name: run consumer tests and generate pacts
+        run: |
+          python -m pytest contract/tests/messages/consumer/test_ex_jaeger_transaction_consumer
+          echo "To check generated pacts"
+          ls -R contract/pacts
+      - name: publish-pact 
+        run: |
+          pact-broker publish contract/pacts -b ${{ env.PACT_BROKER_BASE_URL }} -u ${{ env.PACT_BROKER_USERNAME }} -p ${{ env.PACT_BROKER_PASSWORD }} -h ${{ needs.parepare-env.outputs.BRANCH_NAME }} -a ${{ env.GIT_COMMIT }}
+      - name: Disconnect form Tailscale
+        run: sudo tailscale down
+      - name: remove lable
+        if: always()
+        uses: mondeja/remove-labels-gh-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          labels: |
+              ${{ env.TRIGGER_LABEL }}
+
+
+  deploy-service:
+    runs-on: ubuntu-latest
+    needs: [parepare-env, publish-pact]
+    steps:
+      - name: Check out Repository Code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{github.ref}}
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v1
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo jq
+
+      - name: Find docker image tag
+        id: get_image_tag
+        run: |
+          skopeo login --username ${{ secrets.DOCKERHUB_USERNAME }} --password ${{ secrets.DOCKERHUB_TOKEN }} docker.io
+          START_TIME=$(date +%s)
+          IMAGE=vungle/jaeger
+          VERSION=$(echo ${{ needs.parepare-env.outputs.BRANCH_NAME }} | grep -o 'release-v[0-9]\+\.[0-9]\+\.[0-9]\+' | sed 's/release-//')
+          if [ -z "$VERSION" ]; then
+            echo "PR_NUMBER=${{ needs.parepare-env.outputs.CAL_IMAGE_TAG }}
+          else
+            echo "PR_NUMBER=$VERSION"
+            echo "release version is $VERSION"
+          fi
+          while true; do
+            if [ $(skopeo inspect docker://$IMAGE:$PR_NUMBER | grep $PR_NUMBER| awk '{print $1; exit}') ]; then
+               IMAGE_TAG=$(skopeo inspect docker://$IMAGE:$PR_NUMBER | grep $PR_NUMBER  | awk '{print $1; exit}')
+               echo "IMAGE_TAG=$(echo $IMAGE_TAG | sed 's/,//g')" >> $GITHUB_ENV
+               echo "find $PR_NUMBER  image tag: $IMAGE_TAG"
+               exit 0
+            fi
+            CURRENT_TIME=$(date +%s)
+            ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+            if [ ${ELAPSED_TIME} -gt 30 ]; then
+              echo "Could not find image tag of $PR_NUMBER on Docker Hub after 30 senconds"
+              exit 1
+            fi
+            echo "To find image tag of $PR_NUMBER  ..."
+            sleep 10
+          done
+
+      - name: Get deploy service
+        run: |
+          echo "DEPLOY_SERVICE=$(echo 'jaeger-ct-${{ github.event.pull_request.number }}-${{ needs.parepare-env.outputs.SHORT_SHA }}')" >> $GITHUB_ENV
+      - name: Trigger Jenkins Job
+        run: |
+          curl -X POST https://jenkins.ci.vungle.io/job/ssp/job/ssp_deploy_qa/buildWithParameters --user "emily.huang@vungle.com:1116976c36df736726421f002096c4ee21" --data IMAGE_TAG=${{ needs.parepare-env.outputs.CAL_IMAGE_TAG }} --data HELM_BRANCH=${{ needs.parepare-env.outputs.BRANCH_NAME }} --data HELM_CHART=jaeger --data SERVICE=${{ env.DEPLOY_SERVICE }} --data ACTION=install --data CUSTOM_OVERRIDE_FILE=jaeger-reg-apiqa.yaml
+      - name: check if the service pos is running
+        run: |
+          chmod +x ./.github/scripts/test_request_ads.sh
+          ./.github/scripts/test_request_ads.sh http://${{ env.DEPLOY_SERVICE }}-all.ads-qa.vungle.com ${{ env.IMAGE_TAG }}
+    outputs:
+       IMAGE_TAG: ${{ env.IMAGE_TAG }}
+       DEPLOY_SERVICE: ${{ env.DEPLOY_SERVICE }}
+
+  verify-contract-with-giving-host:
+    runs-on: ubuntu-latest
+    needs: [parepare-env, deploy-service]
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v1
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Check out Repository Code
+        uses: actions/checkout@v3  # https://github.com/actions/checkout
+        with:
+          ref: ${{env.GIT_REF}}
+      - name: Check out pytest running environment
+        run: |
+          docker pull sqli0189/jnlp-agent-pytest:0.2.0-rc
+          pip install pytest
+          pip install pact-python
+          pip install confluent-kafka
+      - name: Update the service host
+        run: |
+          sed -i 's/jaeger-reg-all/"${{ needs.deploy-service.outputs.DEPLOY_SERVICE }}-all"/g' ./contract/settings.py
+      - name: run consumer tests and generate pacts
+        run: |
+          python -m pytest contract/tests/messages/provider --provider-version ${{ needs.deploy-service.outputs.DEPLOY_SERVICE }} --verify-consumer-branch ${{ needs.parepare-env.outputs.BRANCH_NAME }}
+          echo "To check generated pacts"
+
+  can-i-deploy:
+    runs-on: ubuntu-latest
+    needs: verify-contract-with-giving-host
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v1
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: install pact broker cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/pact-foundation/pact-ruby-standalone/master/install.sh | PACT_CLI_VERSION=v2.0.10 bash
+          export PATH=/home/runner/work/jaeger/jaeger/pact/bin/:${PATH}
+      - name: can-i-deploy
+        run: |
+          pact-broker can-i-deploy --pacticipant RecordTransaction --version ${{ env.GIT_COMMIT }} --retry-while-unknown 10 -b ${{ env.PACT_BROKER_BASE_URL }} -u ${{ env.PACT_BROKER_USERNAME }} -p ${{ env.PACT_BROKER_PASSWORD }}
+          pact-broker can-i-deploy --pacticipant PdRecordTransaction --version ${{ env.GIT_COMMIT }} --retry-while-unknown 10 -b ${{ env.PACT_BROKER_BASE_URL }} -u ${{ env.PACT_BROKER_USERNAME }} -p ${{ env.PACT_BROKER_PASSWORD }}
+
+  deploy:
+     runs-on: ubuntu-latest
+     needs: can-i-deploy
+     steps:
+        - name: Connect to Tailscale
+          uses: tailscale/github-action@v1
+          with:
+            authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+        - name: install pact broker cli  
+          run: |
+            curl -fsSL https://raw.githubusercontent.com/pact-foundation/pact-ruby-standalone/master/install.sh | PACT_CLI_VERSION=v2.0.10 bash
+            export PATH=/home/runner/work/jaeger/jaeger/pact/bin/:${PATH}
+        - name: deploy
+          run: |
+            pact-broker record-deployment --pacticipant RecordTransaction --version ${{ env.GIT_COMMIT }} --environment stable
+            pact-broker record-deployment --pacticipant PdRecordTransaction --version ${{ env.GIT_COMMIT }} --environment stable
+          if: ${{ env.BRANCH_NAME }} == 'master' || ${{ env.BRANCH_NAME }} == 'wip-PBJ-xxxx_deploy_pact_broker'
+            
